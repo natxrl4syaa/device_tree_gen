@@ -1,4 +1,4 @@
-name: Generate & Push Device Tree
+name: Ultimate Device Tree + Vendor (Auto Partition Sizes)
 
 on:
   workflow_dispatch:
@@ -14,16 +14,13 @@ on:
         description: 'GitHub reference tree (e.g., mt6897-devs/device_xiaomi_duchamp)'
         required: true
         default: 'mt6897-devs/device_xiaomi_duchamp'
-      new_repo_name:
-        description: 'Name of the new repository to create (e.g., android_device_xiaomi_degas)'
-        required: true
-      target_branch:
-        description: 'Branch name for the new repo (e.g., lineage-23.2)'
+      reference_branch:
+        description: 'Reference branch (e.g., lineage-23.2)'
         required: true
         default: 'lineage-23.2'
 
 jobs:
-  generate-and-push:
+  ultimate-generate:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout this repo (workflow only)
@@ -35,28 +32,77 @@ jobs:
           sudo apt install -y python3-pip wget unzip erofs-utils \
             squashfs-tools lz4 lzop xz-utils zstd android-sdk-libsparse-utils \
             p7zip-full brotli cpio e2fsprogs git rsync
-          pip3 install dumpyara aospdtgen
+          pip3 install dumpyara aospdtgen M2Crypto
 
       - name: Download ROM
         run: wget -O rom.zip "${{ github.event.inputs.rom_url }}"
 
-      - name: Generate device tree with dumpyara
+      # Extract payload.bin for partition info
+      - name: Extract payload.bin from ROM zip
         run: |
-          mkdir generated_tree
-          dumpyara -o generated_tree rom.zip
+          unzip -j rom.zip "payload.bin" -d . || { echo "payload.bin not found at root, searching..."; unzip -l rom.zip | grep payload.bin || { echo "payload.bin not found in ROM zip!"; exit 1; }; PAYLOAD_PATH=$(unzip -l rom.zip | grep -oE "[^ ]+payload\.bin" | head -1); unzip -j rom.zip "$PAYLOAD_PATH" -d .; }
+          ls -lh payload.bin
 
-      - name: Finalize with aospdtgen
+      # Download and run payload-dumper-go to list partitions
+      - name: Download payload-dumper-go
+        run: |
+          wget -O payload-dumper-go.tar.gz https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz
+          tar -xzf payload-dumper-go.tar.gz
+          chmod +x payload-dumper-go
+
+      - name: Get partition sizes from payload.bin
+        id: partition_info
+        run: |
+          ./payload-dumper-go list payload.bin > partition_list.txt
+          cat partition_list.txt
+          # Parse the output to extract sizes for key partitions
+          # We'll create a script to parse and generate BoardConfig.mk snippet
+          python3 <<EOF
+          import re
+          sizes = {}
+          with open('partition_list.txt') as f:
+              for line in f:
+                  # Example line: "system            : 1234567890 bytes"
+                  match = re.search(r'^([a-zA-Z0-9_]+)\s*:\s*(\d+)\s+bytes', line)
+                  if match:
+                      name = match.group(1)
+                      size = match.group(2)
+                      sizes[name] = size
+          # Define the variables we care about
+          var_map = {
+              'BOARD_SUPER_PARTITION_SIZE': 'super',
+              'BOARD_BOOTIMAGE_PARTITION_SIZE': 'boot',
+              'BOARD_DTBOIMG_PARTITION_SIZE': 'dtbo',
+              'BOARD_VENDOR_BOOTIMAGE_PARTITION_SIZE': 'vendor_boot',
+              'BOARD_INIT_BOOT_IMAGE_PARTITION_SIZE': 'init_boot',
+          }
+          with open('partition_sizes.mk', 'w') as out:
+              for var, part in var_map.items():
+                  if part in sizes:
+                      out.write(f"{var} := {sizes[part]}\n")
+                  else:
+                      # If not found, leave as TODO
+                      out.write(f"# TODO: {var} not found – set manually\n")
+          EOF
+          cat partition_sizes.mk
+
+      - name: Generate system dump with dumpyara
+        run: |
+          mkdir dump
+          dumpyara -o dump rom.zip
+
+      - name: Generate device tree with aospdtgen
         run: |
           mkdir -p device_tree
-          python3 -m aospdtgen generated_tree/ -o device_tree/
+          python3 -m aospdtgen dump/ -o device_tree/
 
-      - name: Clone reference repository (lineage-23.2 branch)
+      - name: Clone reference repository
         run: |
-          git clone --branch lineage-23.2 https://github.com/${{ github.event.inputs.reference_repo }}.git reference
+          git clone --branch ${{ github.event.inputs.reference_branch }} https://github.com/${{ github.event.inputs.reference_repo }}.git reference
 
-      - name: Copy essential folders from reference
+      - name: Copy essential folders from reference into device tree
         run: |
-          # Locate the generated device tree (it's often under device_tree/device/xiaomi/generic)
+          # Locate the generated device tree (often under device_tree/device/xiaomi/generic)
           if [ -d "device_tree/device/xiaomi/generic" ]; then
             TARGET_DIR="device_tree/device/xiaomi/generic"
           else
@@ -65,7 +111,6 @@ jobs:
           echo "Target directory: $TARGET_DIR"
           cd "$TARGET_DIR"
 
-          # List of top-level folders to copy from reference (including blob-patches)
           for folder in power sensors lights parts overlay overlay-lineage sepolicy udfps vintf configs include libshims blob-patches; do
             if [ -d "../../../reference/$folder" ]; then
               cp -r "../../../reference/$folder" ./ && echo "Copied $folder"
@@ -74,6 +119,9 @@ jobs:
             fi
           done
 
+          cp ../../../reference/extract-files.py ./ 2>/dev/null || true
+          cp ../../../reference/setup-makefiles.py ./ 2>/dev/null || true
+
       - name: Replace codename in all files
         run: |
           if [ -d "device_tree/device/xiaomi/generic" ]; then
@@ -81,56 +129,59 @@ jobs:
           else
             cd device_tree
           fi
-          # Replace 'duchamp' with device codename
           find . -type f -exec sed -i "s/duchamp/${{ github.event.inputs.device_codename }}/g" {} \;
-          # Replace 'generic' with device codename in paths
           find . -type f -exec sed -i "s|device/xiaomi/generic|device/xiaomi/${{ github.event.inputs.device_codename }}|g" {} \;
 
-      - name: Add TODO markers for device-specific values
+      # Apply partition sizes to BoardConfig.mk
+      - name: Apply partition sizes to BoardConfig.mk
         run: |
           if [ -d "device_tree/device/xiaomi/generic" ]; then
             cd device_tree/device/xiaomi/generic
           else
             cd device_tree
           fi
-          # Mark partition size lines in BoardConfig.mk
-          if [ -f BoardConfig.mk ]; then
-            sed -i '/BOARD_SUPER_PARTITION_SIZE/ s/^/# TODO: FILL CORRECT VALUE FROM YOUR DEVICE\n/' BoardConfig.mk
-            sed -i '/BOARD_XIAOMI_DYNAMIC_PARTITIONS_SIZE/ s/^/# TODO: FILL CORRECT VALUE FROM YOUR DEVICE\n/' BoardConfig.mk
-            echo "# TODO: Verify and adjust other partition sizes (boot, dtbo, vendor_boot, etc.)" >> BoardConfig.mk
-          fi
-          # Add TODO in fstab (if exists)
-          if [ -f rootdir/etc/fstab* ]; then
-            echo "# TODO: Verify mount points and partition names against your device" >> rootdir/etc/fstab*
-          fi
+          # Backup original
+          cp BoardConfig.mk BoardConfig.mk.bak
+          # Remove existing size lines (optional) and append our generated ones
+          # We'll just replace the TODO lines with actual values
+          while IFS= read -r line; do
+            if [[ $line == \#\ TODO:\ FILL\ CORRECT\ VALUE* ]]; then
+              # Skip – will be replaced
+              continue
+            fi
+            echo "$line" >> BoardConfig.mk.new
+          done < BoardConfig.mk
+          # Append our partition sizes
+          cat ${{ github.workspace }}/partition_sizes.mk >> BoardConfig.mk.new
+          # Add a note
+          echo "# Partition sizes auto-filled from payload.bin" >> BoardConfig.mk.new
+          mv BoardConfig.mk.new BoardConfig.mk
+          # Show diff for debugging
+          diff BoardConfig.mk.bak BoardConfig.mk || true
 
-      - name: Remove reference's proprietary-files.txt (we'll generate our own later)
+      - name: Generate vendor tree using extract-files.py
         run: |
           if [ -d "device_tree/device/xiaomi/generic" ]; then
             cd device_tree/device/xiaomi/generic
           else
             cd device_tree
           fi
-          rm -f proprietary-files.txt
+          chmod +x extract-files.py
+          ./extract-files.py ${{ github.workspace }}/dump/
+          if [ -d "../../../vendor/xiaomi/${{ github.event.inputs.device_codename }}" ]; then
+            mkdir -p vendor
+            mv ../../../vendor/xiaomi/${{ github.event.inputs.device_codename }} vendor/
+            echo "Vendor tree moved to device_tree/vendor/"
+          else
+            echo "Vendor tree not found – extraction may have failed."
+            exit 1
+          fi
 
-      - name: Create new repository
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-        run: |
-          gh repo create ${{ github.repository_owner }}/${{ github.event.inputs.new_repo_name }} --public --confirm
-          echo "Repository created: ${{ github.repository_owner }}/${{ github.event.inputs.new_repo_name }}"
+      - name: Final tree structure (for debugging)
+        run: find device_tree -type d | head -50
 
-      - name: Clone new repository and push
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT }}
-        run: |
-          git clone https://${{ github.repository_owner }}:${{ secrets.GH_PAT }}@github.com/${{ github.repository_owner }}/${{ github.event.inputs.new_repo_name }}.git new-repo
-          # Copy the adapted device tree into the new repo
-          rsync -av --delete device_tree/ new-repo/
-          cd new-repo
-          git checkout -b ${{ github.event.inputs.target_branch }}
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add .
-          git commit -m "Initial device tree for ${{ github.event.inputs.device_codename }} (auto‑generated from ${{ github.event.inputs.reference_repo }} lineage-23.2)"
-          git push origin ${{ github.event.inputs.target_branch }}
+      - name: Upload complete device + vendor as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.device_codename }}-full-tree
+          path: device_tree/
