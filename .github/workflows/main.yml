@@ -1,0 +1,136 @@
+name: Generate & Push Device Tree
+
+on:
+  workflow_dispatch:
+    inputs:
+      rom_url:
+        description: 'Direct URL to flashable ROM zip (HyperOS)'
+        required: true
+      device_codename:
+        description: 'Your device codename (e.g., degas)'
+        required: true
+        default: 'degas'
+      reference_repo:
+        description: 'GitHub reference tree (e.g., mt6897-devs/device_xiaomi_duchamp)'
+        required: true
+        default: 'mt6897-devs/device_xiaomi_duchamp'
+      new_repo_name:
+        description: 'Name of the new repository to create (e.g., android_device_xiaomi_degas)'
+        required: true
+      target_branch:
+        description: 'Branch name for the new repo (e.g., lineage-23.2)'
+        required: true
+        default: 'lineage-23.2'
+
+jobs:
+  generate-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo (workflow only)
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y python3-pip wget unzip erofs-utils \
+            squashfs-tools lz4 lzop xz-utils zstd android-sdk-libsparse-utils \
+            p7zip-full brotli cpio e2fsprogs git rsync
+          pip3 install dumpyara aospdtgen
+
+      - name: Download ROM
+        run: wget -O rom.zip "${{ github.event.inputs.rom_url }}"
+
+      - name: Generate device tree with dumpyara
+        run: |
+          mkdir generated_tree
+          dumpyara -o generated_tree rom.zip
+
+      - name: Finalize with aospdtgen
+        run: |
+          mkdir -p device_tree
+          python3 -m aospdtgen generated_tree/ -o device_tree/
+
+      - name: Clone reference repository (lineage-23.2 branch)
+        run: |
+          git clone --branch lineage-23.2 https://github.com/${{ github.event.inputs.reference_repo }}.git reference
+
+      - name: Copy essential folders from reference
+        run: |
+          # Locate the generated device tree (it's often under device_tree/device/xiaomi/generic)
+          if [ -d "device_tree/device/xiaomi/generic" ]; then
+            TARGET_DIR="device_tree/device/xiaomi/generic"
+          else
+            TARGET_DIR="device_tree"
+          fi
+          echo "Target directory: $TARGET_DIR"
+          cd "$TARGET_DIR"
+
+          # List of top-level folders to copy from reference (including blob-patches)
+          for folder in power sensors lights parts overlay overlay-lineage sepolicy udfps vintf configs include libshims blob-patches; do
+            if [ -d "../../../reference/$folder" ]; then
+              cp -r "../../../reference/$folder" ./ && echo "Copied $folder"
+            else
+              echo "Skipping $folder (not found in reference)"
+            fi
+          done
+
+      - name: Replace codename in all files
+        run: |
+          if [ -d "device_tree/device/xiaomi/generic" ]; then
+            cd device_tree/device/xiaomi/generic
+          else
+            cd device_tree
+          fi
+          # Replace 'duchamp' with device codename
+          find . -type f -exec sed -i "s/duchamp/${{ github.event.inputs.device_codename }}/g" {} \;
+          # Replace 'generic' with device codename in paths
+          find . -type f -exec sed -i "s|device/xiaomi/generic|device/xiaomi/${{ github.event.inputs.device_codename }}|g" {} \;
+
+      - name: Add TODO markers for device-specific values
+        run: |
+          if [ -d "device_tree/device/xiaomi/generic" ]; then
+            cd device_tree/device/xiaomi/generic
+          else
+            cd device_tree
+          fi
+          # Mark partition size lines in BoardConfig.mk
+          if [ -f BoardConfig.mk ]; then
+            sed -i '/BOARD_SUPER_PARTITION_SIZE/ s/^/# TODO: FILL CORRECT VALUE FROM YOUR DEVICE\n/' BoardConfig.mk
+            sed -i '/BOARD_XIAOMI_DYNAMIC_PARTITIONS_SIZE/ s/^/# TODO: FILL CORRECT VALUE FROM YOUR DEVICE\n/' BoardConfig.mk
+            echo "# TODO: Verify and adjust other partition sizes (boot, dtbo, vendor_boot, etc.)" >> BoardConfig.mk
+          fi
+          # Add TODO in fstab (if exists)
+          if [ -f rootdir/etc/fstab* ]; then
+            echo "# TODO: Verify mount points and partition names against your device" >> rootdir/etc/fstab*
+          fi
+
+      - name: Remove reference's proprietary-files.txt (we'll generate our own later)
+        run: |
+          if [ -d "device_tree/device/xiaomi/generic" ]; then
+            cd device_tree/device/xiaomi/generic
+          else
+            cd device_tree
+          fi
+          rm -f proprietary-files.txt
+
+      - name: Create new repository
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          gh repo create ${{ github.repository_owner }}/${{ github.event.inputs.new_repo_name }} --public --confirm
+          echo "Repository created: ${{ github.repository_owner }}/${{ github.event.inputs.new_repo_name }}"
+
+      - name: Clone new repository and push
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          git clone https://${{ github.repository_owner }}:${{ secrets.GH_PAT }}@github.com/${{ github.repository_owner }}/${{ github.event.inputs.new_repo_name }}.git new-repo
+          # Copy the adapted device tree into the new repo
+          rsync -av --delete device_tree/ new-repo/
+          cd new-repo
+          git checkout -b ${{ github.event.inputs.target_branch }}
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "Initial device tree for ${{ github.event.inputs.device_codename }} (auto‑generated from ${{ github.event.inputs.reference_repo }} lineage-23.2)"
+          git push origin ${{ github.event.inputs.target_branch }}
