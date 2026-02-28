@@ -6,6 +6,7 @@ on:
       rom_url:
         description: 'Direct URL to flashable ROM zip (HyperOS)'
         required: true
+        default: 'https://xm04.space/MyUrLiwlJzsOOD0BMz8GIywRNEEOFTAINBUpIzE/KzUOPDJBGyEELhsQMDUxIS0eGz8dLzE/Hx4OFQRBDjwfDDQ8Kw8bFQQeNBIuAA4KBCYzPC0wMQofHg4KHwwxED0kQh4nLycSIhcOAh0vMi4XBCsyMjkDED0pGxU0NSwwPS0bFQQcGxEADDkKBCYOFT0uOTI9CjQVACYOQj0DJzgiQQ4CKS8nEhc8AykyBDIyNR8OPDIeGzwHIycDOS8nEi4wQNCLicVQjA5FUAKDiAICCwlADonAyw/JwIHFx8WQgAfFBMT'
       device_codename:
         description: 'Your device codename (e.g., degas)'
         required: true
@@ -37,13 +38,11 @@ jobs:
       - name: Download ROM
         run: wget -O rom.zip "${{ github.event.inputs.rom_url }}"
 
-      # Extract payload.bin for partition info
       - name: Extract payload.bin from ROM zip
         run: |
           unzip -j rom.zip "payload.bin" -d . || { echo "payload.bin not found at root, searching..."; unzip -l rom.zip | grep payload.bin || { echo "payload.bin not found in ROM zip!"; exit 1; }; PAYLOAD_PATH=$(unzip -l rom.zip | grep -oE "[^ ]+payload\.bin" | head -1); unzip -j rom.zip "$PAYLOAD_PATH" -d .; }
           ls -lh payload.bin
 
-      # Download and run payload-dumper-go to list partitions
       - name: Download payload-dumper-go
         run: |
           wget -O payload-dumper-go.tar.gz https://github.com/ssut/payload-dumper-go/releases/download/1.2.2/payload-dumper-go_1.2.2_linux_amd64.tar.gz
@@ -53,22 +52,19 @@ jobs:
       - name: Get partition sizes from payload.bin
         id: partition_info
         run: |
-          ./payload-dumper-go list payload.bin > partition_list.txt
+          # CORRECTED FLAG: -list (with a dash)
+          ./payload-dumper-go -list payload.bin > partition_list.txt
           cat partition_list.txt
-          # Parse the output to extract sizes for key partitions
-          # We'll create a script to parse and generate BoardConfig.mk snippet
           python3 <<EOF
           import re
           sizes = {}
           with open('partition_list.txt') as f:
               for line in f:
-                  # Example line: "system            : 1234567890 bytes"
                   match = re.search(r'^([a-zA-Z0-9_]+)\s*:\s*(\d+)\s+bytes', line)
                   if match:
                       name = match.group(1)
                       size = match.group(2)
                       sizes[name] = size
-          # Define the variables we care about
           var_map = {
               'BOARD_SUPER_PARTITION_SIZE': 'super',
               'BOARD_BOOTIMAGE_PARTITION_SIZE': 'boot',
@@ -81,7 +77,6 @@ jobs:
                   if part in sizes:
                       out.write(f"{var} := {sizes[part]}\n")
                   else:
-                      # If not found, leave as TODO
                       out.write(f"# TODO: {var} not found – set manually\n")
           EOF
           cat partition_sizes.mk
@@ -102,15 +97,12 @@ jobs:
 
       - name: Copy essential folders from reference into device tree
         run: |
-          # Locate the generated device tree (often under device_tree/device/xiaomi/generic)
           if [ -d "device_tree/device/xiaomi/generic" ]; then
             TARGET_DIR="device_tree/device/xiaomi/generic"
           else
             TARGET_DIR="device_tree"
           fi
-          echo "Target directory: $TARGET_DIR"
           cd "$TARGET_DIR"
-
           for folder in power sensors lights parts overlay overlay-lineage sepolicy udfps vintf configs include libshims blob-patches; do
             if [ -d "../../../reference/$folder" ]; then
               cp -r "../../../reference/$folder" ./ && echo "Copied $folder"
@@ -118,7 +110,6 @@ jobs:
               echo "Skipping $folder (not found in reference)"
             fi
           done
-
           cp ../../../reference/extract-files.py ./ 2>/dev/null || true
           cp ../../../reference/setup-makefiles.py ./ 2>/dev/null || true
 
@@ -132,7 +123,6 @@ jobs:
           find . -type f -exec sed -i "s/duchamp/${{ github.event.inputs.device_codename }}/g" {} \;
           find . -type f -exec sed -i "s|device/xiaomi/generic|device/xiaomi/${{ github.event.inputs.device_codename }}|g" {} \;
 
-      # Apply partition sizes to BoardConfig.mk
       - name: Apply partition sizes to BoardConfig.mk
         run: |
           if [ -d "device_tree/device/xiaomi/generic" ]; then
@@ -140,24 +130,16 @@ jobs:
           else
             cd device_tree
           fi
-          # Backup original
           cp BoardConfig.mk BoardConfig.mk.bak
-          # Remove existing size lines (optional) and append our generated ones
-          # We'll just replace the TODO lines with actual values
           while IFS= read -r line; do
             if [[ $line == \#\ TODO:\ FILL\ CORRECT\ VALUE* ]]; then
-              # Skip – will be replaced
               continue
             fi
             echo "$line" >> BoardConfig.mk.new
           done < BoardConfig.mk
-          # Append our partition sizes
           cat ${{ github.workspace }}/partition_sizes.mk >> BoardConfig.mk.new
-          # Add a note
           echo "# Partition sizes auto-filled from payload.bin" >> BoardConfig.mk.new
           mv BoardConfig.mk.new BoardConfig.mk
-          # Show diff for debugging
-          diff BoardConfig.mk.bak BoardConfig.mk || true
 
       - name: Generate vendor tree using extract-files.py
         run: |
@@ -171,14 +153,10 @@ jobs:
           if [ -d "../../../vendor/xiaomi/${{ github.event.inputs.device_codename }}" ]; then
             mkdir -p vendor
             mv ../../../vendor/xiaomi/${{ github.event.inputs.device_codename }} vendor/
-            echo "Vendor tree moved to device_tree/vendor/"
           else
             echo "Vendor tree not found – extraction may have failed."
             exit 1
           fi
-
-      - name: Final tree structure (for debugging)
-        run: find device_tree -type d | head -50
 
       - name: Upload complete device + vendor as artifact
         uses: actions/upload-artifact@v4
